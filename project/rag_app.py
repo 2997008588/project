@@ -1,10 +1,11 @@
 # rag_app.py
 # Streamlit: 课程智能答疑（PDF + FAISS + API LLM）
 # - 多会话侧边栏（新聊天 + 历史对话可切换）
-# - 默认多轮上下文 12 轮（隐藏，不在侧边栏显示）
+# - 默认多轮上下文 12 轮（隐藏，不在 UI 暴露）
 # - 索引扫描 data/pdf（相对脚本目录），管理员可重建
 # - 检索：向量召回 + 关键词重排 + 证据门槛（防止胡说）
-# - 元数据用 JSON（避免 pickle 的 Chunk 类反序列化报错）
+# - 元数据用 JSON（避免 pickle 反序列化报错）
+# - conversations.json 自动迁移/清洗（修复你现在的 TypeError）
 
 from __future__ import annotations
 
@@ -13,7 +14,6 @@ import re
 import json
 import time
 import uuid
-import math
 import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
@@ -70,7 +70,7 @@ MIN_KEYWORD_COVER = 0.08      # 关键词覆盖率（0~1），太低认为不相
 CHUNK_SIZE = 900
 CHUNK_OVERLAP = 160
 
-# Embedding 模型（建议用小模型，部署快）
+# Embedding 模型
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 
 # 目录：相对脚本所在目录（部署不受工作目录影响）
@@ -93,7 +93,6 @@ def safe_get_secret(key: str) -> str:
     这里统一捕获，没取到则返回空字符串。
     """
     try:
-        # st.secrets 支持 dict-like 读取
         val = st.secrets.get(key, "")
         return str(val).strip() if val is not None else ""
     except Exception:
@@ -135,9 +134,8 @@ def tokenize(s: str) -> List[str]:
     简易分词：英文/数字 token + 连续中文片段 token。
     不依赖额外库，够用来做“关键词覆盖”。
     """
-    s = s.lower()
+    s = (s or "").lower()
     toks = re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]+", s)
-    # 去掉很短的噪声 token（例如单个中文“的”等）
     out = []
     for t in toks:
         if len(t) == 1 and re.match(r"[\u4e00-\u9fff]", t):
@@ -147,9 +145,6 @@ def tokenize(s: str) -> List[str]:
 
 
 def keyword_cover(query: str, text: str) -> float:
-    """
-    关键词覆盖率：query tokens 有多少比例出现在 text 中。
-    """
     q = tokenize(query)
     if not q:
         return 0.0
@@ -161,25 +156,19 @@ def keyword_cover(query: str, text: str) -> float:
 def looks_like_noise_chunk(t: str) -> bool:
     """
     过滤“欢迎界面/路径选择界面/运行结果/截图”等低信息内容。
-    这类 chunk 极易误召回，导致你看到的“乱七八糟”回答。
     """
     s = norm_ws(t)
     if len(s) < 60:
         return True
 
-    # 常见 UI/截图噪声
     noise_phrases = [
         "欢迎界面", "路径选择界面", "运行结果", "界面如下", "如图", "截图",
         "单击", "点击", "按钮", "菜单", "安装", "配置", "选择", "下一步"
     ]
-    # “图x-x” 并且很短，基本是图注
     if re.search(r"图\s*\d+\s*[-–]\s*\d+", s) and len(s) < 180:
         return True
-
-    # 命中噪声短句且内容不长
     if any(p in s for p in noise_phrases) and len(s) < 220:
         return True
-
     return False
 
 
@@ -212,11 +201,12 @@ def read_pdf_pages(pdf_path: Path) -> List[Tuple[int, str]]:
     return pages
 
 
-def chunk_pages(pages: List[Tuple[int, str]], source_file: str,
-                chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[Dict[str, Any]]:
-    """
-    将 (page_no, text) 切成 chunk，并记录 page 范围。
-    """
+def chunk_pages(
+    pages: List[Tuple[int, str]],
+    source_file: str,
+    chunk_size: int = CHUNK_SIZE,
+    overlap: int = CHUNK_OVERLAP
+) -> List[Dict[str, Any]]:
     chunks: List[Dict[str, Any]] = []
     buf = ""
     start_page = None
@@ -247,10 +237,8 @@ def chunk_pages(pages: List[Tuple[int, str]], source_file: str,
         else:
             buf = buf + "\n" + txt
 
-        # 超过 chunk_size 就切
         if len(buf) >= chunk_size:
             flush()
-            # overlap：保留末尾一段作为下个 chunk 开头
             if overlap > 0:
                 tail = txt[-overlap:] if len(txt) > overlap else txt
                 buf = tail
@@ -268,8 +256,7 @@ def chunk_pages(pages: List[Tuple[int, str]], source_file: str,
 def load_embedder() -> Any:
     if SentenceTransformer is None:
         raise RuntimeError("缺少 sentence-transformers。请在 requirements.txt 安装 sentence-transformers。")
-    model = SentenceTransformer(EMBED_MODEL_NAME)
-    return model
+    return SentenceTransformer(EMBED_MODEL_NAME)
 
 
 def embed_texts(embedder: Any, texts: List[str]) -> Any:
@@ -291,10 +278,7 @@ def build_manifest(pdfs: List[Path], embed_model: str) -> Dict[str, Any]:
             "size": p.stat().st_size if p.exists() else 0,
             "mtime": int(p.stat().st_mtime) if p.exists() else 0,
         })
-    return {
-        "embed_model": embed_model,
-        "pdfs": items,
-    }
+    return {"embed_model": embed_model, "pdfs": items}
 
 
 def manifest_changed(new_manifest: Dict[str, Any]) -> bool:
@@ -345,7 +329,6 @@ def ensure_index_ready(embedder: Any, force_rebuild: bool = False) -> Tuple[Opti
             return idx, metas, f"索引已就绪：chunks={len(metas)}，PDF={len(pdfs)}"
         need_rebuild = True
 
-    # rebuild
     all_chunks: List[Dict[str, Any]] = []
     for p in pdfs:
         pages = read_pdf_pages(p)
@@ -371,9 +354,6 @@ def ensure_index_ready(embedder: Any, force_rebuild: bool = False) -> Tuple[Opti
 # =========================
 def search_chunks(index: Any, metas: List[Dict[str, Any]], embedder: Any, query: str,
                   recall_k: int = VEC_RECALL_K, top_k: int = EVIDENCE_TOP_K) -> List[Tuple[float, float, Dict[str, Any]]]:
-    """
-    return: List[(final_score, vec_score, meta)]
-    """
     if np is None or faiss is None or index is None or not metas:
         return []
 
@@ -381,26 +361,22 @@ def search_chunks(index: Any, metas: List[Dict[str, Any]], embedder: Any, query:
     D, I = index.search(qv, recall_k)
 
     candidates: List[Tuple[float, Dict[str, Any]]] = []
-    for vec_score, idx in zip(D[0].tolist(), I[0].tolist()):
-        if idx < 0 or idx >= len(metas):
+    for vec_score, idx_i in zip(D[0].tolist(), I[0].tolist()):
+        if idx_i < 0 or idx_i >= len(metas):
             continue
-        m = metas[idx]
+        m = metas[idx_i]
         txt = m.get("text", "")
         if not txt:
             continue
 
-        # 关键词覆盖（必须在重排里占一部分权重）
         kcov = keyword_cover(query, txt)
-
-        # final score = 0.75*vec + 0.25*kcov（你也可以调）
         final = 0.75 * float(vec_score) + 0.25 * float(kcov)
-        candidates.append((final, {
-            **m,
-            "_vec_score": float(vec_score),
-            "_kcov": float(kcov),
-        }))
 
-    # 按 final 排序
+        mm = dict(m)
+        mm["_vec_score"] = float(vec_score)
+        mm["_kcov"] = float(kcov)
+        candidates.append((final, mm))
+
     candidates.sort(key=lambda x: x[0], reverse=True)
 
     out: List[Tuple[float, float, Dict[str, Any]]] = []
@@ -410,17 +386,12 @@ def search_chunks(index: Any, metas: List[Dict[str, Any]], embedder: Any, query:
 
 
 def evidence_is_enough(query: str, scored: List[Tuple[float, float, Dict[str, Any]]]) -> bool:
-    """
-    证据门槛：防止“命中欢迎界面/运行结果”这类内容时 LLM 开始胡写。
-    规则：top1 同时满足向量分数 + 关键词覆盖；或 top3 中至少 2 条满足关键词覆盖。
-    """
     if not scored:
         return False
 
     top1 = scored[0][2]
     v1 = float(top1.get("_vec_score", 0.0))
     k1 = float(top1.get("_kcov", 0.0))
-
     if v1 >= MIN_VEC_SCORE and k1 >= MIN_KEYWORD_COVER:
         return True
 
@@ -429,9 +400,6 @@ def evidence_is_enough(query: str, scored: List[Tuple[float, float, Dict[str, An
 
 
 def format_evidence(scored: List[Tuple[float, float, Dict[str, Any]]]) -> Tuple[str, List[Dict[str, Any]]]:
-    """
-    将 evidence 格式化成 LLM 可用的“编号资料块”，并返回用于展示的结构化列表。
-    """
     blocks = []
     show_list: List[Dict[str, Any]] = []
 
@@ -460,32 +428,25 @@ def format_evidence(scored: List[Tuple[float, float, Dict[str, Any]]]) -> Tuple[
 # Multi-turn: build standalone query
 # =========================
 def needs_context(q: str) -> bool:
-    q = q.strip()
+    q = (q or "").strip()
     if len(q) <= 8:
         return True
-    # 典型追问指代
     if any(x in q for x in ["它", "这", "有什么作用", "和它", "区别", "为什么", "怎么用"]):
         return True
     return False
 
 
 def build_search_query(messages: List[Dict[str, str]], current_q: str) -> str:
-    """
-    用历史问题拼成更稳的检索 query（默认 12 轮，不在 UI 暴露）。
-    """
-    current_q = current_q.strip()
+    current_q = (current_q or "").strip()
     if not messages:
         return current_q
 
-    # 取历史里的 user 问题
-    hist_q = [m["content"] for m in messages if m.get("role") == "user"]
+    hist_q = [m.get("content", "") for m in messages if m.get("role") == "user"]
     hist_q = [x.strip() for x in hist_q if x.strip()]
-
     if not hist_q:
         return current_q
 
     if needs_context(current_q):
-        # 取最近 2 个问题做拼接更稳（避免过长）
         tail = hist_q[-2:] if len(hist_q) >= 2 else hist_q[-1:]
         return "；".join(tail + [current_q])
 
@@ -498,16 +459,12 @@ def build_search_query(messages: List[Dict[str, str]], current_q: str) -> str:
 SYSTEM_PROMPT = """你是“课程智能答疑助手”。你只能依据我提供的“可用资料”回答问题。
 强约束：
 1) 只能使用资料中的信息，不允许编造、不允许推荐外部教材/网站。
-2) 你的回答必须引用资料编号，例如：[1][3]。
-3) 如果资料不足以回答，必须直接说“资料不足”，并说明你需要的关键词/章节方向，但仍然只能基于当前资料做推断。
-4) 不要输出“根据提供的证据我无法找到”这类冗长废话；要么回答，要么资料不足。
+2) 回答必须引用资料编号，例如：[1][3]。
+3) 如果资料不足以回答，必须直接说“资料不足”，并说明你需要的关键词/章节方向（不要写废话）。
 """
 
 def call_llm(base: str, model: str, api_key: str, messages: List[Dict[str, str]],
              temperature: float = 0.2, max_tokens: int = 700) -> Tuple[Optional[str], Optional[str]]:
-    """
-    return (text, error)
-    """
     if requests is None:
         return None, "缺少 requests 依赖。"
     if not api_key:
@@ -531,7 +488,7 @@ def call_llm(base: str, model: str, api_key: str, messages: List[Dict[str, str]]
     s.trust_env = False
 
     last_err = None
-    for _ in range(2):  # retry 2 times
+    for _ in range(2):
         try:
             r = s.post(
                 url,
@@ -553,27 +510,120 @@ def call_llm(base: str, model: str, api_key: str, messages: List[Dict[str, str]]
 
 
 # =========================
-# Conversation store
+# Conversation store (FIXED)
 # =========================
+def _clean_messages(msgs: Any) -> List[Dict[str, Any]]:
+    if not isinstance(msgs, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content")
+        if role not in ("user", "assistant", "system"):
+            continue
+        if content is None:
+            continue
+        out.append({
+            "role": role,
+            "content": str(content),
+            "ts": int(m.get("ts") or time.time())
+        })
+    return out
+
+
+def normalize_conv_store(data: Any) -> Dict[str, Any]:
+    """
+    兼容旧版本/错误格式，统一清洗成：
+    {
+      "active_id": str,
+      "conversations": [
+        {"id": str, "title": str, "created_at": int, "messages": [...]},
+        ...
+      ]
+    }
+    """
+    if not isinstance(data, dict):
+        data = {}
+
+    convs = data.get("conversations", [])
+    # 兼容 conversations 是 dict（按 id 做 key）
+    if isinstance(convs, dict):
+        convs = list(convs.values())
+    if not isinstance(convs, list):
+        convs = []
+
+    cleaned: List[Dict[str, Any]] = []
+    for c in convs:
+        if not isinstance(c, dict):
+            continue
+
+        cid = c.get("id") or c.get("cid") or c.get("conversation_id")
+        if not isinstance(cid, str) or not cid.strip():
+            cid = uuid.uuid4().hex
+
+        title = c.get("title") or c.get("name") or "未命名对话"
+        if not isinstance(title, str) or not title.strip():
+            title = "未命名对话"
+
+        created_at = c.get("created_at")
+        try:
+            created_at = int(created_at) if created_at is not None else int(time.time())
+        except Exception:
+            created_at = int(time.time())
+
+        msgs = c.get("messages") or c.get("history") or []
+        msgs = _clean_messages(msgs)
+
+        cleaned.append({
+            "id": cid,
+            "title": title,
+            "created_at": created_at,
+            "messages": msgs
+        })
+
+    active_id = data.get("active_id", "")
+    if not isinstance(active_id, str):
+        active_id = ""
+
+    # 如果 active_id 不存在或不匹配，指向第一条
+    if cleaned:
+        ids = {c["id"] for c in cleaned}
+        if active_id not in ids:
+            active_id = cleaned[0]["id"]
+    else:
+        active_id = ""
+
+    return {"active_id": active_id, "conversations": cleaned}
+
+
 def load_conv_store() -> Dict[str, Any]:
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
     if not CONV_STORE_PATH.exists():
-        return {"active_id": "", "conversations": []}
+        store = {"active_id": "", "conversations": []}
+        return store
+
     try:
-        data = json.loads(CONV_STORE_PATH.read_text("utf-8"))
-        if not isinstance(data, dict):
-            return {"active_id": "", "conversations": []}
-        if "conversations" not in data:
-            data["conversations"] = []
-        if "active_id" not in data:
-            data["active_id"] = ""
-        return data
+        raw = json.loads(CONV_STORE_PATH.read_text("utf-8"))
     except Exception:
+        # 文件坏了就直接重置
         return {"active_id": "", "conversations": []}
+
+    store = normalize_conv_store(raw)
+
+    # 如果清洗后结构有变化，直接回写，避免下次再炸
+    try:
+        CONV_STORE_PATH.write_text(json.dumps(store, ensure_ascii=False, indent=2), "utf-8")
+    except Exception:
+        pass
+
+    return store
 
 
 def save_conv_store(store: Dict[str, Any]) -> None:
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    store = normalize_conv_store(store)
     CONV_STORE_PATH.write_text(json.dumps(store, ensure_ascii=False, indent=2), "utf-8")
 
 
@@ -590,6 +640,7 @@ def unique_title(existing: List[str], base: str) -> str:
 
 
 def create_new_conversation(store: Dict[str, Any]) -> str:
+    store = normalize_conv_store(store)
     cid = uuid.uuid4().hex
     titles = [c.get("title", "") for c in store.get("conversations", [])]
     title = unique_title(titles, "未命名对话")
@@ -605,23 +656,27 @@ def create_new_conversation(store: Dict[str, Any]) -> str:
 
 
 def get_active_conversation(store: Dict[str, Any]) -> Dict[str, Any]:
+    store = normalize_conv_store(store)
     active_id = store.get("active_id", "")
     for c in store.get("conversations", []):
         if c.get("id") == active_id:
             return c
-    # 没有 active 就创建一个
+
     if store.get("conversations"):
         store["active_id"] = store["conversations"][0]["id"]
         save_conv_store(store)
         return store["conversations"][0]
+
     cid = create_new_conversation(store)
-    return next(c for c in store["conversations"] if c["id"] == cid)
+    store = load_conv_store()
+    for c in store.get("conversations", []):
+        if c.get("id") == cid:
+            return c
+    # fallback
+    return {"id": cid, "title": "未命名对话", "created_at": int(time.time()), "messages": []}
 
 
 def set_conversation_title_if_needed(conv: Dict[str, Any], store: Dict[str, Any]) -> None:
-    """
-    用第一条 user 问题自动命名（不带 # 长串）。
-    """
     if conv.get("title") and conv["title"] != "未命名对话":
         return
     msgs = conv.get("messages", [])
@@ -633,9 +688,7 @@ def set_conversation_title_if_needed(conv: Dict[str, Any], store: Dict[str, Any]
     if not first_q:
         return
 
-    # 截断为 18 字左右
-    name = first_q.replace("\n", " ")
-    name = re.sub(r"\s+", " ", name).strip()
+    name = re.sub(r"\s+", " ", first_q.replace("\n", " ")).strip()
     if len(name) > 18:
         name = name[:18] + "…"
 
@@ -654,21 +707,46 @@ def trim_messages(conv: Dict[str, Any]) -> None:
 # UI: Sidebar
 # =========================
 def sidebar_conversations(store: Dict[str, Any]) -> Dict[str, Any]:
-    st.sidebar.header("对话")
+    store = normalize_conv_store(store)
 
+    st.sidebar.header("对话")
     if st.sidebar.button("＋ 新聊天", use_container_width=True):
         create_new_conversation(store)
+        store = load_conv_store()
 
     convs = store.get("conversations", [])
     if not convs:
         create_new_conversation(store)
+        store = load_conv_store()
         convs = store.get("conversations", [])
 
-    id_to_title = {c["id"]: c.get("title", "未命名对话") for c in convs}
-    options = [c["id"] for c in convs]
+    # 防御式构造（避免 c 不是 dict 再炸）
+    options: List[str] = []
+    id_to_title: Dict[str, str] = {}
+    for c in convs:
+        if not isinstance(c, dict):
+            continue
+        cid = c.get("id")
+        if not isinstance(cid, str) or not cid:
+            continue
+        options.append(cid)
+        title = c.get("title", "未命名对话")
+        id_to_title[cid] = title if isinstance(title, str) and title.strip() else "未命名对话"
 
-    # 用 radio 显示展开列表（效果接近你截图那种“历史对话主题展开”）
-    active_id = store.get("active_id", options[0])
+    if not options:
+        # 极端情况：清洗后仍空，重建一个
+        create_new_conversation(store)
+        store = load_conv_store()
+        convs = store.get("conversations", [])
+        options = [convs[0]["id"]] if convs else []
+        id_to_title = {convs[0]["id"]: convs[0].get("title", "未命名对话")} if convs else {}
+
+    active_id = store.get("active_id", options[0] if options else "")
+    if active_id not in options and options:
+        active_id = options[0]
+        store["active_id"] = active_id
+        save_conv_store(store)
+
     selected = st.sidebar.radio(
         label="",
         options=options,
@@ -679,33 +757,28 @@ def sidebar_conversations(store: Dict[str, Any]) -> Dict[str, Any]:
         store["active_id"] = selected
         save_conv_store(store)
 
-    # 状态区
     with st.sidebar.expander("状态", expanded=False):
         base, model, key = get_llm_cfg()
         st.write("LLM_BASE_URL =", base)
         st.write("LLM_MODEL =", model)
         st.write("LLM_API_KEY =", ("已设置" if bool(key) else "未设置"))
 
-    # Debug（可选）
     st.sidebar.checkbox("Debug", key="debug_mode")
 
-    # 管理员区
+    # 管理员区：不再 st.stop() 阻塞应用，只做“隐藏/显示”控制
     with st.sidebar.expander("管理员", expanded=False):
         admin_token = get_admin_token()
         if not admin_token:
-            st.info("未设置 ADMIN_TOKEN（Secrets/环境变量）。将隐藏索引重建功能。")
-            st.stop()
-
-        entered = st.text_input("ADMIN_TOKEN", type="password", key="admin_token_input")
-        ok = (entered.strip() == admin_token)
-        if ok:
-            st.success("管理员验证通过")
+            st.caption("未设置 ADMIN_TOKEN（Secrets/环境变量），将隐藏“重建索引”。")
         else:
-            st.warning("请输入正确 ADMIN_TOKEN")
-            st.stop()
-
-        if st.button("重建索引（扫描 data/pdf）", use_container_width=True):
-            st.session_state.force_rebuild = True
+            entered = st.text_input("ADMIN_TOKEN", type="password", key="admin_token_input")
+            ok = (entered.strip() == admin_token)
+            if ok:
+                st.success("管理员验证通过")
+                if st.button("重建索引（扫描 data/pdf）", use_container_width=True):
+                    st.session_state.force_rebuild = True
+            else:
+                st.caption("输入正确 ADMIN_TOKEN 才显示重建按钮。")
 
     return store
 
@@ -721,23 +794,22 @@ def render_chat(conv: Dict[str, Any]) -> None:
             st.markdown(content)
 
 
-def answer_one_turn(conv: Dict[str, Any], store: Dict[str, Any],
-                    index: Any, metas: List[Dict[str, Any]],
-                    embedder: Any, user_q: str) -> None:
-    # append user message
+def answer_one_turn(
+    conv: Dict[str, Any],
+    store: Dict[str, Any],
+    index: Any,
+    metas: List[Dict[str, Any]],
+    embedder: Any,
+    user_q: str
+) -> None:
     conv.setdefault("messages", []).append({"role": "user", "content": user_q, "ts": int(time.time())})
     trim_messages(conv)
     save_conv_store(store)
     set_conversation_title_if_needed(conv, store)
 
-    # build retrieval query (multi-turn)
     search_q = build_search_query(conv["messages"][:-1], user_q)
-
-    # retrieve
     scored = search_chunks(index, metas, embedder, search_q)
     evidence_txt, evidence_list = format_evidence(scored)
-
-    # decide enough?
     enough = evidence_is_enough(search_q, scored)
 
     base, model, key = get_llm_cfg()
@@ -747,21 +819,19 @@ def answer_one_turn(conv: Dict[str, Any], store: Dict[str, Any],
             st.markdown("资料不足：当前 PDF 片段与问题不匹配，无法基于现有资料给出可靠回答。")
             if st.session_state.get("debug_mode"):
                 st.markdown(f"**本轮用于检索的问题：** {search_q}")
-            # 展示 topK 证据，方便你判断是否该调 chunk/模型
             with st.expander("本次检索到的证据（Top-K）", expanded=True):
                 for e in evidence_list:
-                    st.markdown(f"**[{e['i']}] {e['file_name']} p{e['page_start']}-{e['page_end']}**  "
-                                f"(vec={e['vec']:.3f}, kcov={e['kcov']:.3f})")
+                    st.markdown(
+                        f"**[{e['i']}] {e['file_name']} p{e['page_start']}-{e['page_end']}**  "
+                        f"(vec={e['vec']:.3f}, kcov={e['kcov']:.3f})"
+                    )
                     st.write(e["text"][:1200])
             answer = "资料不足：检索到的片段与问题关键词不匹配，无法基于现有PDF给出可靠回答。"
         else:
-            # Build messages: system + (history last N) + user with evidence
             hist = conv.get("messages", [])[:-1]
-            # 只取最近 MAX_MESSAGES 以免上下文过长
             hist = hist[-MAX_MESSAGES:]
 
             llm_messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
-            # 把历史对话带上（多轮对话）
             for m in hist:
                 if m.get("role") in ("user", "assistant"):
                     llm_messages.append({"role": m["role"], "content": m.get("content", "")})
@@ -782,7 +852,6 @@ def answer_one_turn(conv: Dict[str, Any], store: Dict[str, Any],
 
             if err or not text:
                 st.error(err or "LLM 返回空内容")
-                # 失败时退回“资料摘要”
                 with st.expander("已返回检索到的资料摘要（未生成扩展解释）", expanded=True):
                     for e in evidence_list:
                         st.markdown(f"**[{e['i']}] {e['file_name']} p{e['page_start']}-{e['page_end']}**")
@@ -790,15 +859,15 @@ def answer_one_turn(conv: Dict[str, Any], store: Dict[str, Any],
                 answer = f"LLM 调用失败：{err}"
             else:
                 st.markdown(text)
-                # 展示证据
                 with st.expander("本次检索到的证据（Top-K）", expanded=False):
                     for e in evidence_list:
-                        st.markdown(f"**[{e['i']}] {e['file_name']} p{e['page_start']}-{e['page_end']}**  "
-                                    f"(vec={e['vec']:.3f}, kcov={e['kcov']:.3f})")
+                        st.markdown(
+                            f"**[{e['i']}] {e['file_name']} p{e['page_start']}-{e['page_end']}**  "
+                            f"(vec={e['vec']:.3f}, kcov={e['kcov']:.3f})"
+                        )
                         st.write(e["text"][:1200])
                 answer = text
 
-    # append assistant
     conv["messages"].append({"role": "assistant", "content": answer, "ts": int(time.time())})
     trim_messages(conv)
     save_conv_store(store)
@@ -808,19 +877,17 @@ def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
 
-    # init store
     store = load_conv_store()
     store = sidebar_conversations(store)
+    store = load_conv_store()  # sidebar 操作后再读一次确保一致
     conv = get_active_conversation(store)
 
-    # embedder
     try:
         embedder = load_embedder()
     except Exception as e:
         st.error(f"Embedding 初始化失败：{e}")
         st.stop()
 
-    # index ready
     force = bool(st.session_state.get("force_rebuild", False))
     try:
         idx, metas, status = ensure_index_ready(embedder, force_rebuild=force)
@@ -830,11 +897,9 @@ def main() -> None:
         st.stop()
 
     st.info(status)
-
     if idx is None or not metas:
         st.stop()
 
-    # chat render
     render_chat(conv)
 
     user_q = st.chat_input("请输入你的问题（支持多轮追问）")
