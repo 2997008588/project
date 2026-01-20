@@ -1,0 +1,8 @@
+streamlit
+requests
+certifi
+numpy
+faiss-cpu
+pypdf
+sentence-transformers
+torch
